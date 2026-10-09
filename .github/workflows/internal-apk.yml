@@ -11,7 +11,7 @@ on:
 
 permissions:
   actions: read
-  contents: write
+  contents: read
 
 concurrency:
   group: internal-apk-signing
@@ -25,7 +25,7 @@ jobs:
     environment: internal-apk-signing
     permissions:
       actions: read
-      contents: write
+      contents: read
     steps:
       - name: Sign verified upstream release artifact without executing source code
         shell: bash
@@ -146,22 +146,16 @@ jobs:
           (output/'signature-verification.txt').write_text(verification)
           (output/'apk-badging.txt').write_text(badging)
           (output/'SHA256SUMS.txt').write_text(digest+'  '+apk.name+'\n')
-          tag = 'internal-android-1.18.1-run-' + os.environ['GITHUB_RUN_ID']
-          release = api('/releases', {'tag_name': tag, 'target_commitish': SHA, 'name': 'Hermes Relay 1.18.1 internal arm64', 'body': 'Built from upstream '+SHA+' in '+source['html_url']+'. Stable internal test signing; not compatible with upstream/store signatures. Android 8+ arm64 only. No device testing claimed. Signing evidence included.', 'draft': False, 'prerelease': True, 'make_latest': 'false'}, 'POST')
-          upload_base = release['upload_url'].split('{')[0]
-          for file in output.iterdir():
-              req = urllib.request.Request(upload_base+'?name='+urllib.parse.quote(file.name), data=file.read_bytes(), headers={'Authorization': 'Bearer '+token, 'Content-Type': 'application/vnd.android.package-archive' if file.suffix=='.apk' else 'application/octet-stream'}, method='POST')
-              with urllib.request.urlopen(req, timeout=180) as res: published = json.load(res)
-              assert published['size'] == file.stat().st_size
-          release_readback = api('/releases/' + str(release['id']))
-          published_apk = [a for a in release_readback['assets'] if a['name'] == apk.name]
-          assert len(published_apk) == 1 and published_apk[0]['size'] == apk.stat().st_size
-          with urllib.request.urlopen(published_apk[0]['browser_download_url'], timeout=180) as res: readback = res.read()
-          assert hashlib.sha256(readback).hexdigest() == digest
-          (output/'release-url.txt').write_text(release_readback['html_url']+'\n')
-          print(json.dumps(metadata, indent=2)); print(release_readback['html_url'])
+          print(json.dumps(metadata, indent=2))
+          run_url = 'https://github.com/' + REPO + '/actions/runs/' + os.environ['GITHUB_RUN_ID']
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-              f.write('APK: '+published_apk[0]['browser_download_url']+'\n\nSHA-256: `'+digest+'`\n\nNo device testing claimed.\n')
+              f.write('## Hermes Relay 1.18.1 internal arm64 APK\n\n')
+              f.write('APK artifact: **stable-internal-apk-' + os.environ['GITHUB_RUN_ID'] + '** (download from this run)\n\n')
+              f.write('SHA-256: `' + digest + '`\n\n')
+              f.write('Package: `' + match.group(1) + '` · versionCode `' + match.group(2) + '` · arm64-v8a only\n\n')
+              f.write('Cert SHA-256: `' + certs[0] + '`\n\n')
+              f.write('Source run: ' + source['html_url'] + '\n\n')
+              f.write('No device testing claimed.\n')
           PY
       - name: Retain signed APK and observed evidence
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
