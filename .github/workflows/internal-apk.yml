@@ -23,6 +23,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: internal-apk-signing
+    permissions:
+      actions: read
+      contents: write
     steps:
       - name: Sign verified upstream release artifact without executing source code
         shell: bash
