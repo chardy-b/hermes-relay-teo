@@ -1,0 +1,169 @@
+name: Stable internal APK delivery
+run-name: Internal Hermes Relay APK from run ${{ inputs.source_run }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run:
+        description: Successful exact-source all-final build run
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: internal-apk-signing
+  cancel-in-progress: false
+
+jobs:
+  sign:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: internal-apk-signing
+    steps:
+      - name: Sign verified upstream release artifact without executing source code
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+          KEYSTORE_B64: ${{ secrets.INTERNAL_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.INTERNAL_KEYSTORE_PASSWORD }}
+          SECRET_SIGNER_SHA256: ${{ secrets.INTERNAL_SIGNER_SHA256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          private_dir="$(mktemp -d "$RUNNER_TEMP/internal-apk.XXXXXX")"
+          export PRIVATE_DIR="$private_dir"
+          trap 'rm -rf -- "$private_dir"' EXIT HUP INT TERM
+          python3 - <<'PY'
+          import base64, hashlib, io, json, os, pathlib, re, subprocess, urllib.error, urllib.parse, urllib.request, zipfile
+          REPO = 'chardy-b/hermes-relay-teo'
+          SHA = '62de6b51289d933a3f8d68841652b044130aa72f'
+          BUILD_WORKFLOW_SHA = '52f3f7565811828824d42bc9b432296271a2f9c3'
+          SIGNER = '3176ae55da9fad0f50f935cb4e60346d3ca95d9a9529ba811e9a3191985d3aba'
+          PACKAGE = 'com.axiomlabs.hermesrelay.sideload'
+          VERSION_CODE = '59'
+          VERSION_NAME = '1.18.1-sideload'
+          run = os.environ['SOURCE_RUN']
+          assert re.fullmatch(r'[1-9][0-9]{0,19}', run), 'Invalid source run ID'
+          assert os.environ['GITHUB_REPOSITORY'] == REPO
+          assert os.environ['GITHUB_REF'] == 'refs/heads/main'
+          assert os.environ['SECRET_SIGNER_SHA256'].lower() == SIGNER
+          assert os.environ['KEYSTORE_B64'] and os.environ['KEYSTORE_PASSWORD']
+          private = pathlib.Path(os.environ['PRIVATE_DIR'])
+          output = pathlib.Path('internal-apk'); output.mkdir()
+          token = os.environ['GH_TOKEN']
+          headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+          base = 'https://api.github.com/repos/' + REPO
+          def api(path, data=None, method=None):
+              req = urllib.request.Request(base + path, headers=headers, data=None if data is None else json.dumps(data).encode(), method=method)
+              with urllib.request.urlopen(req, timeout=60) as res:
+                  body = res.read()
+                  return json.loads(body) if body else None
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, hdrs, newurl): return None
+          def download(path):
+              req = urllib.request.Request(base + path, headers=headers)
+              try:
+                  with urllib.request.build_opener(NoRedirect()).open(req, timeout=60) as res: return res.read()
+              except urllib.error.HTTPError as e:
+                  if e.code != 302: raise
+                  location = e.headers['Location']
+                  assert urllib.parse.urlparse(location).scheme == 'https'
+                  with urllib.request.urlopen(location, timeout=120) as res: return res.read()
+          source = api('/actions/runs/' + run)
+          assert source['status'] == 'completed' and source['conclusion'] == 'success'
+          assert source['path'] == '.github/workflows/ci-required.yml'
+          assert source['head_sha'] == BUILD_WORKFLOW_SHA and source['head_branch'] == 'main'
+          assert source['event'] == 'workflow_dispatch'
+          artifacts = api('/actions/runs/' + run + '/artifacts?per_page=100')
+          assert artifacts['total_count'] <= 100
+          matches = [a for a in artifacts['artifacts'] if a['name'] == 'release-smoke-' + SHA and not a['expired']]
+          assert len(matches) == 1, 'Missing or ambiguous exact-source release artifact'
+          artifact = matches[0]
+          def validate_zip(z):
+              names = z.namelist()
+              assert len(names) == len(set(names)), 'Duplicate ZIP entries'
+              assert sum(i.file_size for i in z.infolist()) < 2_000_000_000
+              for name in names:
+                  p = pathlib.PurePosixPath(name)
+                  assert not p.is_absolute() and '..' not in p.parts and '\\' not in name
+              assert z.testzip() is None, 'ZIP CRC failure'
+          archive = zipfile.ZipFile(io.BytesIO(download('/actions/artifacts/' + str(artifact['id']) + '/zip')))
+          validate_zip(archive)
+          apk_names = [n for n in archive.namelist() if '/sideload/release/' in '/' + n and n.endswith('.apk')]
+          assert len(apk_names) == 1
+          original = archive.read(apk_names[0])
+          original_sha = hashlib.sha256(original).hexdigest()
+          original_zip = zipfile.ZipFile(io.BytesIO(original)); validate_zip(original_zip)
+          def signature(name):
+              return name.upper() == 'META-INF/MANIFEST.MF' or (name.upper().startswith('META-INF/') and name.upper().endswith(('.RSA', '.DSA', '.EC', '.SF')))
+          def other_abi(name):
+              return name.startswith('lib/') and len(name.split('/')) >= 3 and name.split('/')[1] != 'arm64-v8a'
+          expected = {i.filename: hashlib.sha256(original_zip.read(i)).hexdigest() for i in original_zip.infolist() if not signature(i.filename) and not other_abi(i.filename)}
+          assert any(n.startswith('lib/arm64-v8a/') for n in expected)
+          unsigned = private / 'arm64-unsigned.apk'
+          with zipfile.ZipFile(unsigned, 'w') as dest:
+              for entry in original_zip.infolist():
+                  if not signature(entry.filename) and not other_abi(entry.filename):
+                      dest.writestr(entry, original_zip.read(entry))
+          tools_root = pathlib.Path(os.environ['ANDROID_HOME']) / 'build-tools'
+          versions = [p for p in tools_root.iterdir() if (p/'apksigner').is_file() and (p/'zipalign').is_file() and (p/'aapt').is_file()]
+          tools = max(versions, key=lambda p: tuple(int(n) for n in re.findall(r'\d+', p.name)))
+          aligned = private / 'aligned.apk'
+          subprocess.run([str(tools/'zipalign'), '-P', '16', '-f', '4', str(unsigned), str(aligned)], check=True)
+          keystore = private / 'internal.p12'
+          try:
+              fd = os.open(keystore, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(fd, 'wb') as f: f.write(base64.b64decode(os.environ['KEYSTORE_B64'], validate=True))
+              apk = output / 'hermes-relay-1.18.1-internal-arm64.apk'
+              subprocess.run([str(tools/'apksigner'), 'sign', '--ks', str(keystore), '--ks-key-alias', 'hermes-relay-internal', '--ks-pass', 'env:KEYSTORE_PASSWORD', '--key-pass', 'env:KEYSTORE_PASSWORD', '--out', str(apk), str(aligned)], check=True)
+          finally:
+              keystore.unlink(missing_ok=True)
+          os.environ.pop('KEYSTORE_B64', None); os.environ.pop('KEYSTORE_PASSWORD', None)
+          verification = subprocess.check_output([str(tools/'apksigner'), 'verify', '--verbose', '--print-certs', str(apk)], text=True)
+          certs = re.findall(r'Signer #\d+ certificate SHA-256 digest: ([0-9a-fA-F]+)', verification)
+          assert certs == [SIGNER], verification
+          assert 'Number of signers: 1' in verification
+          subprocess.run([str(tools/'zipalign'), '-c', '-P', '16', '4', str(apk)], check=True)
+          badging = subprocess.check_output([str(tools/'aapt'), 'dump', 'badging', str(apk)], text=True)
+          match = re.search(r"package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", badging)
+          assert match and match.groups() == (PACKAGE, VERSION_CODE, VERSION_NAME)
+          assert re.search(r"^native-code: 'arm64-v8a'$", badging, re.M)
+          with zipfile.ZipFile(apk) as signed:
+              validate_zip(signed)
+              actual = {i.filename: hashlib.sha256(signed.read(i)).hexdigest() for i in signed.infolist() if not signature(i.filename)}
+              assert actual == expected, 'Non-signature payload changed beyond ABI slice'
+          digest = hashlib.sha256(apk.read_bytes()).hexdigest()
+          metadata = {'source_repository': REPO, 'source_sha': SHA, 'source_run_id': int(run), 'source_workflow_sha': BUILD_WORKFLOW_SHA, 'artifact_id': artifact['id'], 'original_apk_sha256': original_sha, 'package': match.group(1), 'version_code': int(match.group(2)), 'version_name': match.group(3), 'abis': ['arm64-v8a'], 'signer_count': len(certs), 'certificate_sha256': certs[0], 'apk_bytes': apk.stat().st_size, 'apk_sha256': digest, 'signature_verified': True, 'alignment_16k_verified': True, 'payload_comparison': 'Only other-ABI and signature entries changed', 'device_tested': False, 'signing_run_id': int(os.environ['GITHUB_RUN_ID']), 'signing_workflow_sha': os.environ['GITHUB_SHA']}
+          (output/'signing-evidence.json').write_text(json.dumps(metadata, indent=2)+'\n')
+          (output/'signature-verification.txt').write_text(verification)
+          (output/'apk-badging.txt').write_text(badging)
+          (output/'SHA256SUMS.txt').write_text(digest+'  '+apk.name+'\n')
+          tag = 'internal-android-1.18.1-run-' + os.environ['GITHUB_RUN_ID']
+          release = api('/releases', {'tag_name': tag, 'target_commitish': SHA, 'name': 'Hermes Relay 1.18.1 internal arm64', 'body': 'Built from upstream '+SHA+' in '+source['html_url']+'. Stable internal test signing; not compatible with upstream/store signatures. Android 8+ arm64 only. No device testing claimed. Signing evidence included.', 'draft': False, 'prerelease': True, 'make_latest': 'false'}, 'POST')
+          upload_base = release['upload_url'].split('{')[0]
+          for file in output.iterdir():
+              req = urllib.request.Request(upload_base+'?name='+urllib.parse.quote(file.name), data=file.read_bytes(), headers={'Authorization': 'Bearer '+token, 'Content-Type': 'application/vnd.android.package-archive' if file.suffix=='.apk' else 'application/octet-stream'}, method='POST')
+              with urllib.request.urlopen(req, timeout=180) as res: published = json.load(res)
+              assert published['size'] == file.stat().st_size
+          release_readback = api('/releases/' + str(release['id']))
+          published_apk = [a for a in release_readback['assets'] if a['name'] == apk.name]
+          assert len(published_apk) == 1 and published_apk[0]['size'] == apk.stat().st_size
+          with urllib.request.urlopen(published_apk[0]['browser_download_url'], timeout=180) as res: readback = res.read()
+          assert hashlib.sha256(readback).hexdigest() == digest
+          (output/'release-url.txt').write_text(release_readback['html_url']+'\n')
+          print(json.dumps(metadata, indent=2)); print(release_readback['html_url'])
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('APK: '+published_apk[0]['browser_download_url']+'\n\nSHA-256: `'+digest+'`\n\nNo device testing claimed.\n')
+          PY
+      - name: Retain signed APK and observed evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: stable-internal-apk-${{ github.run_id }}
+          path: internal-apk/
+          if-no-files-found: error
+          retention-days: 30
